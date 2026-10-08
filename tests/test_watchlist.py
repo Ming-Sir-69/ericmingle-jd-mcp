@@ -59,3 +59,16 @@ class WatchlistTests(unittest.TestCase):
         obstacle.write_text("fixture")
         self.store.path = obstacle / "cannot_create.sqlite3"
         self.store.observe({"url": self.url, "price": 9.9})
+
+    def test_remove_persists_and_clears_only_matching_local_records(self):
+        self.store.upsert(self.url, "办公", 12.5)
+        self.store.observe({"url": self.url, "title": "fixture", "price": 9.9})
+        with self.store.connect() as db:
+            db.execute("CREATE TABLE notify_refresh(url TEXT PRIMARY KEY, next_at REAL)")
+            db.executemany("INSERT INTO notify_refresh VALUES(?,?)", [(self.url, 1), ("other", 2)])
+        self.assertTrue(self.store.remove(self.url)["data"]["removed"])
+        self.assertEqual(self.make().list()["data"]["items"], [])
+        with self.make().connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM quotes").fetchone()[0], 0)
+            self.assertEqual([r[0] for r in db.execute("SELECT url FROM notify_refresh")], ["other"])
+        self.assertFalse(self.make().remove(self.url)["data"]["removed"])

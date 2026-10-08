@@ -46,6 +46,10 @@ class JDCommerce:
         return text.strip() if text is not None else None
     def _fail(self, code, **values):
         return {**self.identity(),'success':False,'error':code,**values}
+    def _unknown_add(self, operation_id, receipt):
+        return self._fail('unknown',operation_id=operation_id,reason=receipt.get('error') or 'insufficient_evidence',
+                          **{k:receipt[k] for k in ('audit','risk_control','requires_user_login','current_page') if k in receipt},
+                          message='已单次尝试，结果未确认；同operation_id仅只读核对，不再次点击。')
     async def _commerce_eval(self, code):
         # The adapter supplies its existing trusted decoding and bridge boundary.
         raw=self._decode(await self.bridge.command('evaluate',{'code':code}))
@@ -141,7 +145,7 @@ class JDCommerce:
             if not raw.get('audit',{}).get('changed'):
                 self.write_journal.set(key,False)
                 return {**self.identity(),**raw}
-            if raw.get('error') in {'risk_control','login_required','checkout_page_reached','page_changed'}:return {**self.identity(),**raw}
+            if raw.get('error') in {'risk_control','login_required','checkout_page_reached','page_changed'}:return self._unknown_add(operation_id or fingerprint,raw)
             action_verified=bool(raw.get('audit',{}).get('verified'))
             action_proof=raw.get('audit',{}).get('proof')
             redirected=bool(raw.get('redirected_to_cart'))
@@ -150,13 +154,18 @@ class JDCommerce:
                 while time.monotonic()<probe_deadline:
                     try:
                         probe=await self._within(self._commerce_eval(add_probe_script(item_id,raw.get('audit',{}).get('cart_count_before'),raw.get('audit',{}).get('had_success_toast',False))),probe_deadline)
-                        if probe.get('error') in {'risk_control','login_required','checkout_page_reached','page_changed'}:return {**self.identity(),**probe}
+                        if probe.get('error') in {'risk_control','login_required','checkout_page_reached','page_changed'}:return self._unknown_add(operation_id or fingerprint,{**probe,'audit':raw.get('audit',{})})
                         action_verified=bool(probe.get('verified'))
                         action_proof=probe.get('proof')
                         redirected=bool(probe.get('redirected_to_cart'))
                         if action_verified or redirected:break
                     except Exception:break
                     await asyncio.sleep(min(0.25,max(0,probe_deadline-time.monotonic())))
+            if action_verified and action_proof in {'new_success_toast','cart_count_changed'}:
+                item={'product_id':item_id,'sku_id':item_id,'sku_text':sku,'quantity':None,'fields':{'quantity':'missing'}}
+                self.write_journal.record(key,{'status':'done','fingerprint':fingerprint,'item':item})
+                return {**self.identity(),'success':True,'item':item,'operation_id':operation_id or fingerprint,
+                        'audit':{**raw.get('audit',{}),'verified':True,'proof':action_proof,'confirmation':action_proof}}
             readback_error=None
             try:after=await self._within(self._cart_state(),deadline)
             except Exception as exc:after={};readback_error=type(exc).__name__
@@ -165,7 +174,7 @@ class JDCommerce:
                     diagnostic={'before_total_count':before.get('total_count'),'after_total_count':None,'target_count':None,'cart_error':'cart_unavailable'}
                     self.write_journal.record(key,{**self.write_journal.get(key),'last_readback':diagnostic,'audit':raw.get('audit',{})})
                     return self._fail('unknown',reason='cart_unavailable',operation_id=operation_id or fingerprint,audit={**raw.get('audit',{}),'readback':diagnostic},message='京东购物车加载失败；已停止读回，不重试写入，结果仍未知。')
-                if after.get('error') in {'risk_control','login_required','checkout_page_reached','page_changed'}:return {**self.identity(),**after}
+                if after.get('error') in {'risk_control','login_required','checkout_page_reached','page_changed'}:return self._unknown_add(operation_id or fingerprint,{**after,'audit':raw.get('audit',{})})
                 matches=self._matching(after,item_id,sku)
                 quantity_verified=len(matches)==1 and old_qty is not None and matches[0].get('quantity')==old_qty+qty
                 redirected_verified=redirected and len(matches)==1 and matches[0].get('quantity')==(old_qty+qty if old_qty is not None else qty)
@@ -301,6 +310,14 @@ class JDCommerce:
         self._product_url(url)
         if not isinstance(text,str) or not text.strip() or not 1<=len(text)<=500 or '\x00' in text:raise ValueError('text须为1至500字正文')
         return await self._merchant(url,text)
+    async def _ready_merchant(self,item_id):
+        deadline=time.monotonic()+10
+        probe={'success':False,'error':'merchant_identity_unverified'}
+        while True:
+            try:probe=await self._within(self._commerce_eval(merchant_script(item_id)),deadline)
+            except TimeoutError:return probe
+            if probe.get('error')!='merchant_identity_unverified' or time.monotonic()>=deadline:return probe
+            await asyncio.sleep(min(0.25,deadline-time.monotonic()))
     async def _merchant(self,url,text=None):
         url=self._product_url(url);item_id=re.search(r'([0-9]+)\.html$',url)[1]
         fingerprint=hashlib.sha256((item_id+'\n'+(text or '')).encode()).hexdigest()
@@ -313,7 +330,9 @@ class JDCommerce:
                 return self._fail('previous_action_unverified',send_attempted=False)
             signals=await self.navigate('https://jdcs.jd.com/index.action?pid='+item_id,business=True)
             if signals['risk_control'] or signals['requires_user_login']:return self.blocked(signals)
-            probe=await self._commerce_eval(merchant_script(item_id))
+            front=await self._front_cart_page()
+            if front:return front
+            probe=await self._ready_merchant(item_id)
             if not probe.get('success') or text is None:return {**self.identity(),**probe,'product_url':url,'send_attempted':False}
             target=probe.get('object') or {}
             if target.get('product_id')!=item_id or not target.get('recipient') or not probe.get('send_available') or probe.get('draft_present'):

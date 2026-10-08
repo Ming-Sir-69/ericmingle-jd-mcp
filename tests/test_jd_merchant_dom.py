@@ -30,3 +30,7 @@ const context={document,location:{href:p.url||'https://jdcs.jd.com/index.action?
   path=Path(__file__).resolve().parents[1]/'src/jd_merchant_dom.py'
   sys.path.insert(0,str(path.parent));spec=importlib.util.spec_from_file_location('jd_merchant_dom',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
   self.assertNotIn('setTimeout',m.merchant_script('123','问库存','商品店'))
+ def test_wrong_host_or_pid_is_explicit_page_changed_without_send(self):
+  for url in ['https://evil.example/index.action?pid=123','https://jdcs.jd.com/index.action?pid=124']:
+   result=self.run_case(url=url)
+   self.assertEqual(result['data']['error'],'page_changed');self.assertEqual(result['clicks'],0)

@@ -536,7 +536,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                 await session.initialize()
                 result = await session.list_tools()
                 self.assertEqual({tool.name for tool in result.tools}, {
-                    "login_jd", "status_jd", "search_jd", "get_jd_product", "close_jd_browser", "favorite_jd_item", "unfavorite_jd_item", "watchlist_upsert", "watchlist_list", "watchlist_check", "cart_list", "add_to_cart", "remove_from_cart", "merchant_messages", "contact_merchant", "notification_configure", "notification_status", "notify_owner"})
+                    "login_jd", "status_jd", "search_jd", "get_jd_product", "close_jd_browser", "favorite_jd_item", "unfavorite_jd_item", "watchlist_upsert", "watchlist_list", "watchlist_check", "watchlist_remove", "cart_list", "add_to_cart", "remove_from_cart", "merchant_messages", "contact_merchant", "notification_configure", "notification_status", "notify_owner", "favorite_list", "conversation_list"})
                 for tool in result.tools:
                     self.assertNotIn("platform", tool.inputSchema.get("properties", {}))
 

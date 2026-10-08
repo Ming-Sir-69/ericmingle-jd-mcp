@@ -6,9 +6,12 @@ def merchant_script(product_id,body=None,recipient=None):
 
 SCRIPT=r'''
 const normalize=s=>String(s||'').replace(/\s+/g,' ').trim();
-const object=()=>{
+const merchantPage=()=>{
  const u=new URL(location.href);
- if(u.protocol!=='https:'||u.hostname!=='jdcs.jd.com'||u.pathname!=='/index.action'||u.searchParams.getAll('pid').length!==1||u.searchParams.get('pid')!==cfg.id)return null;
+ return u.protocol==='https:'&&u.hostname==='jdcs.jd.com'&&u.pathname==='/index.action'&&u.searchParams.getAll('pid').length===1&&u.searchParams.get('pid')===cfg.id;
+};
+const object=()=>{
+ if(!merchantPage())return null;
  const active=all('.dialog.active');if(active.length!==1)return null;
  const names=[...active[0].querySelectorAll('.dialog-detail-header-name')].filter(visible);
  if(names.length!==1||!text(names[0]))return null;
@@ -18,6 +21,7 @@ const object=()=>{
 };
 const messages=()=>all('.message--content').map(n=>({text:text(n).slice(0,1000)})).filter(x=>x.text).slice(-20);
 let stop=guard();if(stop)return stop;
+if(!merchantPage())return fail('page_changed');
 const target=object();if(!target||(cfg.recipient!==null&&cfg.recipient!==target.recipient))return fail('merchant_identity_unverified');
 const editors=all('pre.send-textarea[contenteditable]'),send=all('.input-field--send-btn').filter(n=>n.tagName==='DIV'&&text(n)==='发送');
 if(cfg.body===null)return JSON.stringify({success:true,object:target,messages:messages(),send_available:editors.length===1&&send.length===1,draft_present:editors.length===1&&!!String(editors[0].textContent||'').trim()});

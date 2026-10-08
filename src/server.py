@@ -35,6 +35,8 @@ from http_security import protect_http
 from watchlist import Watchlist, register_watchlist
 from notifications import Notifications, register_notifications
 from jd_dom import SEARCH_SCRIPT, DETAIL_SCRIPT, DETAIL_SELECTORS, READINESS_SCRIPT
+from jd_lists_dom import favorite_list_script, conversation_list_script
+from jd_search_dom import search_page_script
 import importlib.util
 _helper_spec = importlib.util.spec_from_file_location("jd_pure_helpers", UPSTREAM / "jd_taobao_mcp" / "extractors" / "helpers.py")
 _helpers = importlib.util.module_from_spec(_helper_spec)
@@ -375,7 +377,7 @@ class JDBridgeAdapter(JDCommerce):
         self._last_business_at = now
         return None
 
-    async def search(self, keyword: str, max_results: int = 5, min_price=None, max_price=None, sort="default"):
+    async def search(self, keyword: str, max_results: int = 5, min_price=None, max_price=None, sort="default",page=1):
         if not isinstance(keyword, str):
             raise ValueError("关键词必须是文本")
         keyword = keyword.strip()
@@ -389,7 +391,9 @@ class JDBridgeAdapter(JDCommerce):
             raise ValueError("价格区间无效")
         if not isinstance(max_results, int) or isinstance(max_results, bool):
             raise ValueError("max_results必须是整数")
-        limit = max(1, min(5, max_results))
+        if not isinstance(page,int) or isinstance(page,bool) or page<1:
+            raise ValueError('page须为大于等于1的整数')
+        limit = max(1, min(20, max_results))
         async with self._lock:
             if self._risk:
                 return self.blocked(self._risk)
@@ -399,6 +403,9 @@ class JDBridgeAdapter(JDCommerce):
             signals = await self.navigate("https://search.jd.com/Search?keyword=" + quote_plus(keyword), business=True)
             if signals["risk_control"] or signals["requires_user_login"]:
                 return self.blocked(signals)
+            if page!=1:
+                pagination=await self._search_page(page)
+                if not pagination.get('success'):return public_result({**self.identity(),**pagination,'page':page})
             code = "(() => JSON.stringify((" + SEARCH_SCRIPT + ")(" + str(40) + ")))()"
             raw = decoded_data(await self.bridge.command("evaluate", {"code": code}))
             if not isinstance(raw, list):
@@ -431,6 +438,8 @@ class JDBridgeAdapter(JDCommerce):
             items = items[:limit]
             out = public_result({**after, **self.identity(), "success": bool(items), "status": "ok" if items else "no_products_extracted",
                                   "keyword": keyword, "search_url": after["current_url"], "count": len(items), "items": items,
+                                  "page":page,"page_scope":"platform_ui",
+                                  "sort_scope": "page_local" if sort != "default" else "platform_default",
                                   "filters": {"min_price": min_price, "max_price": max_price, "sort": sort, "include_details": False},
                                   "message": "已读取少量商品。" if items else "未提取到可核对商品，可能无结果或页面结构变化；不会自动重试。"})
             try:
@@ -438,6 +447,28 @@ class JDBridgeAdapter(JDCommerce):
             except (OSError, sqlite3.Error):
                 out["local_quote_saved"] = False
             return out
+
+    async def _search_page(self,page):
+        deadline=time.monotonic()+10
+        while True:
+            try:state=await self._within(self._commerce_eval(search_page_script(page)),deadline)
+            except TimeoutError:return self._fail('page_not_ready')
+            if not state.get('success'):return state
+            if state.get('active_page') and state.get('ids'):break
+            if time.monotonic()>=deadline:return self._fail('page_not_ready')
+            await asyncio.sleep(min(0.25,deadline-time.monotonic()))
+        if state.get('active_page')==page:return state
+        before=set(state['ids'])
+        clicked=await self._commerce_eval(search_page_script(page,click=True))
+        if not clicked.get('success'):return clicked
+        deadline=time.monotonic()+10
+        while time.monotonic()<deadline:
+            try:state=await self._within(self._commerce_eval(search_page_script(page)),deadline)
+            except TimeoutError:break
+            if not state.get('success'):return state
+            if state.get('active_page')==page and state.get('ids') and set(state['ids'])!=before:return state
+            await asyncio.sleep(min(0.25,max(0,deadline-time.monotonic())))
+        return self._fail('page_unverified',message='已单次点页码，页码与商品结果集尚未同时确认变化；没有再次点击。')
 
     async def product(self, url: str):
         url = ensure_product_url(url)
@@ -499,6 +530,42 @@ class JDBridgeAdapter(JDCommerce):
             except (OSError, sqlite3.Error):
                 result["local_quote_saved"] = False
             return public_result(result)
+
+    async def favorite_list(self,page=1):
+        if not isinstance(page,int) or isinstance(page,bool) or page<1:
+            raise ValueError('page须为大于等于1的整数')
+        return await self._native_list('favorites',page)
+
+    async def conversation_list(self):
+        return await self._native_list('conversations')
+
+    async def _native_list(self,kind,page=1):
+        async with self._lock:
+            blocked=self._commerce_guard()
+            if blocked:return blocked
+            url='https://t.jd.com/home/follow' if kind=='favorites' else 'https://jdcs.jd.com/index.action'
+            signals=await self.navigate(url,business=True)
+            if signals['risk_control'] or signals['requires_user_login']:return self.blocked(signals)
+            script=favorite_list_script(page) if kind=='favorites' else conversation_list_script()
+            raw=await self._ready_list(script)
+            if not raw.get('success'):return public_result({**self.identity(),**raw})
+            if kind=='favorites' and page!=1:
+                candidates={p['url'] for p in raw.get('pages',[]) if p.get('page')==page and isinstance(p.get('url'),str)}
+                if len(candidates)!=1:return public_result(self._fail('unsupported',page=page,message='当前关注页未提供可核对的该页链接；不猜翻页URL。'))
+                signals=await self.navigate(candidates.pop(),business=True)
+                if signals['risk_control'] or signals['requires_user_login']:return self.blocked(signals)
+                raw=await self._ready_list(script)
+            raw.pop('pages',None)
+            return public_result({**self.identity(),**raw})
+
+    async def _ready_list(self,script):
+        deadline=time.monotonic()+10
+        raw={'success':False,'error':'page_not_ready','items':[],'count':0}
+        while True:
+            try:raw=await self._within(self._commerce_eval(script),deadline)
+            except TimeoutError:return raw
+            if raw.get('items') or not raw.get('success') or time.monotonic()>=deadline:return raw
+            await asyncio.sleep(min(0.25,deadline-time.monotonic()))
 
     async def write(self, action: str, url: str, sku: str | None = None, qty: int = 1):
         url = ensure_product_url(url)
@@ -572,9 +639,9 @@ def build_mcp(adapter: JDBridgeAdapter) -> FastMCP:
 
     @server.tool(annotations=read)
     async def search_jd(keyword: str, max_results: int = 5, min_price: float | None = None,
-                        max_price: float | None = None, sort: str = "default") -> dict[str, Any]:
-        """搜索京东商品（每次最多返回5件）；本地筛价/排序，不逐个打开详情。sort: default/price_asc/price_desc。"""
-        return await public_tool_call(adapter.search(keyword, max_results, min_price, max_price, sort))
+                        max_price: float | None = None, sort: str = "default",page: int = 1) -> dict[str, Any]:
+        """搜索京东商品（每次最多返回20件）；page只能点当前实际可见的页码并核结果变化。本页本地筛价/排序；sort: default/price_asc/price_desc。"""
+        return await public_tool_call(adapter.search(keyword, max_results, min_price, max_price, sort,page))
 
     @server.tool(annotations=read)
     async def get_jd_product(url: str) -> dict[str, Any]:
@@ -597,6 +664,16 @@ def build_mcp(adapter: JDBridgeAdapter) -> FastMCP:
     async def unfavorite_jd_item(url: str) -> dict[str, Any]:
         """对称取消指定商品关注；已取消返回成功，不重复点击。"""
         return await public_tool_call(adapter.write("unfavorite", url))
+
+    @server.tool(annotations=read)
+    async def favorite_list(page: int = 1) -> dict[str, Any]:
+        """读取京东官方已关注商品页的当前渲染行；页码仅沿实际可见分页链接，缺字段标missing，不宣称全量。"""
+        return await public_tool_call(adapter.favorite_list(page))
+
+    @server.tool(annotations=read)
+    async def conversation_list() -> dict[str, Any]:
+        """读取官方客服会话概览（对象、时间、短摘要、可取得的商品定位）；不发消息、不导出全文。"""
+        return await public_tool_call(adapter.conversation_list())
 
     @server.tool(annotations=read)
     async def cart_list() -> dict[str, Any]:

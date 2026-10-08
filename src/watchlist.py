@@ -38,6 +38,15 @@ class Watchlist:
             db.execute("INSERT INTO list VALUES(?,?,?) ON CONFLICT(url) DO UPDATE SET category=excluded.category,target_price=excluded.target_price", (url, category.strip(), target_price))
         return self.result({"url": url, "category": category.strip(), "target_price": target_price})
 
+    def remove(self, url):
+        url = self.validate_url(url)
+        with self.connect() as db:
+            removed = db.execute("DELETE FROM list WHERE url=?", (url,)).rowcount > 0
+            db.execute("DELETE FROM quotes WHERE url=?", (url,))
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='notify_refresh'").fetchone():
+                db.execute("DELETE FROM notify_refresh WHERE url=?", (url,))
+        return self.result({"url": url, "removed": removed})
+
     def observe(self, result):
         """Internal only: feed results from this service's real search/detail reads."""
         try:
@@ -107,3 +116,8 @@ def register_watchlist(mcp, store):
     async def watchlist_check() -> dict:
         """返回一小时内真实展示价达到目标的条目；仅调用时检查，无后台监控或主动通知。"""
         return call(store.check)
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False))
+    async def watchlist_remove(url: str) -> dict:
+        """删除本地清单条目及其缓存报价、通知刷新计划；不改变平台收藏或购物车。重复删除返回 removed=false。"""
+        return call(store.remove, url)

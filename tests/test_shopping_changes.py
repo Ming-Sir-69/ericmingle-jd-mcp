@@ -3,6 +3,16 @@ import unittest
 from test_local_adapter import load_adapter, FakeBridge
 
 class ShoppingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_search_limit_accepts_twenty_and_reports_page_local_sort(self):
+        module=load_adapter(self)
+        with tempfile.TemporaryDirectory() as folder:
+            bridge=FakeBridge()
+            bridge.result=[{'title':f'商品{i}','url':f'https://item.jd.com/{i}.html','price_text':str(i)} for i in range(1,26)]
+            adapter=module.JDBridgeAdapter(bridge,data_dir=folder)
+            result=await adapter.search('手机',20,sort='price_desc')
+            self.assertEqual(result['count'],20)
+            self.assertEqual(result['sort_scope'],'page_local')
+            self.assertEqual(result['items'][0]['price'],25)
     async def test_risk_persists_close_and_requires_login(self):
         module = load_adapter(self)
         with tempfile.TemporaryDirectory() as folder:

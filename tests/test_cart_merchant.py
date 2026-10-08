@@ -86,6 +86,31 @@ class CartMerchantTests(unittest.IsolatedAsyncioTestCase):
             r=await self.module.public_tool_call(self.adapter.contact_merchant(url,text))
             self.assertEqual(r['error_code'],'invalid_input')
         self.assertEqual(self.bridge.calls,[])
+    async def test_merchant_messages_waits_for_same_page_identity_without_sending(self):
+        original=self.bridge.command;reads=0
+        async def command(action,args=None):
+            nonlocal reads
+            if action=='evaluate' and 'JD_MERCHANT_CONVERSATION' in (args or {}).get('code',''):
+                reads+=1
+                if reads==1:return {'success':False,'error':'merchant_identity_unverified'}
+                return {'success':True,'object':{'product_id':'123','recipient':'商品店'},'messages':[]}
+            return await original(action,args)
+        self.bridge.command=command
+        r=await self.adapter.merchant_messages('https://item.jd.com/123.html')
+        self.assertTrue(r['success']);self.assertFalse(r['send_attempted']);self.assertEqual(reads,2)
+        self.assertEqual(len([1 for action,_ in self.bridge.calls if action=='navigate']),1)
+        self.assertEqual(self.bridge.mutation_calls,0)
+        self.assertTrue(any(action=='cdp' for action,_ in self.bridge.calls))
+    async def test_merchant_wrong_page_stops_immediately_without_identity_wait(self):
+        original=self.bridge.command;reads=0
+        async def command(action,args=None):
+            nonlocal reads
+            if action=='evaluate' and 'JD_MERCHANT_CONVERSATION' in (args or {}).get('code',''):
+                reads+=1;return {'success':False,'error':'page_changed'}
+            return await original(action,args)
+        self.bridge.command=command
+        r=await self.adapter.merchant_messages('https://item.jd.com/123.html')
+        self.assertEqual(r['error'],'page_changed');self.assertEqual(reads,1)
     async def test_tools_expose_separate_cart_and_merchant_contracts(self):
         tools={t.name:t for t in await self.module.build_mcp(self.adapter).list_tools()}
         for name in ['cart_list','add_to_cart','remove_from_cart','merchant_messages','contact_merchant']:
@@ -265,6 +290,25 @@ class CartMerchantTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r['error'],'unknown');self.assertEqual(r['reason'],'cart_unavailable');self.assertEqual(reads,2)
         self.assertEqual(self.adapter.write_journal.get('add:unavailable-after')['status'],'pending')
         self.assertEqual(self.bridge.mutation_calls,1)
+    async def test_new_success_toast_finishes_without_optional_cart_readback(self):
+        reads=0
+        async def states():
+            nonlocal reads
+            reads+=1
+            if reads==1:return {'success':True,'complete':False,'items':[],'total_count':66}
+            return {'success':False,'error':'cart_unavailable','items':[],'complete':False}
+        self.adapter._cart_state=states
+        self.bridge.mutation_result={'success':True,'audit':{'changed':True,'verified':True,'proof':'new_success_toast'}}
+        r=await self.adapter.add_to_cart('https://item.jd.com/123.html','黑色',1,'toast-receipt')
+        self.assertTrue(r['success']);self.assertEqual(r['audit']['proof'],'new_success_toast')
+        self.assertEqual(reads,1);self.assertEqual(self.bridge.mutation_calls,1)
+        self.assertEqual(self.adapter.write_journal.get('add:toast-receipt')['status'],'done')
+    async def test_post_click_page_change_is_unknown_with_operation_id_and_no_reclick(self):
+        self.bridge.mutation_result={'success':False,'error':'page_changed','audit':{'changed':True,'verified':False}}
+        r=await self.adapter.add_to_cart('https://item.jd.com/123.html','黑色',1,'changed-after-click')
+        self.assertEqual(r['error'],'unknown');self.assertEqual(r['reason'],'page_changed')
+        self.assertEqual(r['operation_id'],'changed-after-click');self.assertEqual(self.bridge.mutation_calls,1)
+        self.assertEqual(self.adapter.write_journal.get('add:changed-after-click')['status'],'pending')
     async def test_cart_fronts_only_the_verified_owned_page_before_cart_navigation(self):
         self.bridge.url='https://www.jd.com/';self.bridge.tabs=[{'tabId':123,'url':self.bridge.url}]
         original=self.bridge.command
