@@ -521,7 +521,7 @@ class ToolErrorPrivacyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
-    async def test_stdio_exposes_exactly_five_tools_without_platform_switch_or_launch(self):
+    async def test_stdio_exposes_platform_tools_without_platform_switch_or_launch(self):
         load_adapter(self)
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
@@ -532,7 +532,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                 await session.initialize()
                 result = await session.list_tools()
                 self.assertEqual({tool.name for tool in result.tools}, {
-                    "login_jd", "status_jd", "search_jd", "get_jd_product", "close_jd_browser", "favorite_jd_item", "unfavorite_jd_item", "watchlist_upsert", "watchlist_list", "watchlist_check"})
+                    "login_jd", "status_jd", "search_jd", "get_jd_product", "close_jd_browser", "favorite_jd_item", "unfavorite_jd_item", "watchlist_upsert", "watchlist_list", "watchlist_check", "cart_list", "add_to_cart", "remove_from_cart", "merchant_messages", "contact_merchant", "notification_configure", "notification_status", "notify_owner"})
                 for tool in result.tools:
                     self.assertNotIn("platform", tool.inputSchema.get("properties", {}))
 

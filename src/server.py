@@ -30,8 +30,10 @@ import httpx
 sys.path.insert(0, str(ROOT / "src"))
 from commerce_state import result, RiskStore
 from shopping_dom import favorite_script
+from jd_commerce import JDCommerce, WriteJournal
 from http_security import protect_http
 from watchlist import Watchlist, register_watchlist
+from notifications import Notifications, register_notifications
 from jd_dom import SEARCH_SCRIPT, DETAIL_SCRIPT, DETAIL_SELECTORS, READINESS_SCRIPT
 import importlib.util
 _helper_spec = importlib.util.spec_from_file_location("jd_pure_helpers", UPSTREAM / "jd_taobao_mcp" / "extractors" / "helpers.py")
@@ -211,7 +213,7 @@ def detail_fields(reason: str, url: str) -> dict[str, Any]:
     return result
 
 
-class JDBridgeAdapter:
+class JDBridgeAdapter(JDCommerce):
     """Use only session-created tabs in the user's already-running Brave."""
     def __init__(self, bridge: WebBridgeClient, *, data_dir=None):
         self.bridge = bridge
@@ -219,6 +221,10 @@ class JDBridgeAdapter:
         self.risk_store = RiskStore(data_dir or os.environ.get("MCP_DATA_DIR", os.environ.get("JD_MCP_DATA_DIR", str(ROOT / "runtime"))))
         self.__risk = {"risk_control": True} if self.risk_store.load() else None
         self.watchlist = Watchlist("jd", ensure_product_url, self.risk_store.path.parent)
+        self.write_journal = WriteJournal(self.risk_store.path.parent)
+        self._decode = decoded_data
+        self._product_url = ensure_product_url
+        self.notifications = Notifications(self.watchlist, self.product)
         self._clock = time.monotonic
         self._last_business_at: float | None = None
 
@@ -234,7 +240,7 @@ class JDBridgeAdapter:
     def identity(self):
         return {"platform": "jd", "network": "existing-browser", "backend": "kimi-webbridge",
                 "session": BRIDGE_SESSION, "profile_path": None, "browser_profile": "existing-daily-Brave",
-                "login_verified": False, "read_only": False, "capabilities": {"favorite_item": "implemented_unverified_live", "unfavorite_item": "implemented_unverified_live", "add_to_cart": "unsupported", "remove_from_cart": "unsupported"}}
+                "login_verified": False, "read_only": False, "capabilities": {"favorite_item": "implemented_unverified_live", "unfavorite_item": "implemented_unverified_live", "add_to_cart": "implemented_unverified_live", "remove_from_cart": "implemented_unverified_live", "cart_list":"implemented_unverified_live", "merchant_messages":"implemented_unverified_live", "contact_merchant":"implemented_unverified_live"}}
 
     async def owned_tabs(self):
         data = decoded_data(await self.bridge.command("list_tabs"))
@@ -525,8 +531,8 @@ async def public_tool_call(operation: Awaitable[dict[str, Any]]) -> dict[str, An
 
 def build_mcp(adapter: JDBridgeAdapter) -> FastMCP:
     server = FastMCP(
-        "JD-Local-ReadOnly",
-        instructions="京东少量查询与可验证的商品收藏。登录/验证码由本人在可见窗口完成。禁止购买、下单、支付或改账户。小量查询，遇风控停止。status_jd 的登录迹象不代表验证成功。",
+        "JD-Local-Commerce",
+        instructions="京东少量查询、可验证的收藏/购物车及明确对象的商家交流。登录/验证码由本人在可见窗口完成。禁止购买、下单、支付或改账户。小量查询，遇风控停止。status_jd 的登录迹象不代表验证成功。",
         host=HTTP_HOST, port=HTTP_PORT, streamable_http_path="/mcp", stateless_http=True,
         json_response=True, log_level="WARNING",
         transport_security=TransportSecuritySettings(
@@ -574,12 +580,40 @@ def build_mcp(adapter: JDBridgeAdapter) -> FastMCP:
         """对称取消指定商品关注；已取消返回成功，不重复点击。"""
         return await public_tool_call(adapter.write("unfavorite", url))
 
+    @server.tool(annotations=read)
+    async def cart_list() -> dict[str, Any]:
+        """读取京东官方购物车的商品编号、规格、数量及单价；不结算。"""
+        return await public_tool_call(adapter.cart_list())
+
+    @server.tool(annotations=write)
+    async def add_to_cart(url: str, sku_text: str | None = None, qty: int = 1, operation_id: str | None = None) -> dict[str, Any]:
+        """精确商品与已选规格新增1至3件；operation_id持久去重，省略时同参数沿用默认ID，未知结果禁止重试。"""
+        return await public_tool_call(adapter.add_to_cart(url, sku_text, qty, operation_id))
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True))
+    async def remove_from_cart(item_id: str, sku_text: str | None = None) -> dict[str, Any]:
+        """按数字商品编号及精确规格删除唯一购物车行；多行或对象不明时拒绝。"""
+        return await public_tool_call(adapter.remove_from_cart(item_id, sku_text))
+
+    @server.tool(annotations=read)
+    async def merchant_messages(url: str) -> dict[str, Any]:
+        """读取指定SKU的官方客服会话最近消息；官方PID/商品卡/唯一活动对象不一致时拒绝。"""
+        return await public_tool_call(adapter.merchant_messages(url))
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True))
+    async def contact_merchant(url: str, text: str) -> dict[str, Any]:
+        """明确商品URL及1至500字正文；确认官方PID/商品卡/唯一活动对象后单次发送，读回才成功；结果未知不重试。"""
+        return await public_tool_call(adapter.contact_merchant(url, text))
+
     register_watchlist(server, adapter.watchlist)
+    if hasattr(adapter, "notifications"):
+        register_notifications(server, adapter.notifications)
     return server
 
 
 async def run_server(server: FastMCP, adapter: JDBridgeAdapter, *, stdio: bool) -> None:
     try:
+        adapter.notifications.start()
         if stdio:
             await server.run_stdio_async()
         else:
@@ -588,11 +622,12 @@ async def run_server(server: FastMCP, adapter: JDBridgeAdapter, *, stdio: bool) 
                                                log_level="warning")).serve()
     finally:
         # Release only loopback HTTP resources; never auto-close daily browser tabs.
+        await adapter.notifications.close()
         await adapter.bridge.aclose()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Independent local JD read-only MCP (HTTP 127.0.0.1:8842/mcp)")
+    parser = argparse.ArgumentParser(description="Independent local JD commerce MCP (HTTP 127.0.0.1:8842/mcp)")
     transport = parser.add_mutually_exclusive_group()
     transport.add_argument("--stdio", action="store_true", help="stdio protocol, for local clients or offline checks")
     transport.add_argument("--http", action="store_true", help="Streamable HTTP (default)")
