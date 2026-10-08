@@ -26,3 +26,7 @@ const context={document,location:{href:p.url||'https://jdcs.jd.com/index.action?
    self.assertEqual(self.run_case(**case)['clicks'],0,case)
  def test_unknown_receipt_single_send_and_no_retry(self):
   r=self.run_case(unverified=True);self.assertEqual(r['clicks'],1);self.assertEqual(r['data']['error'],'unverified')
+ def test_sender_has_no_browser_timer(self):
+  path=Path(__file__).resolve().parents[1]/'src/jd_merchant_dom.py'
+  sys.path.insert(0,str(path.parent));spec=importlib.util.spec_from_file_location('jd_merchant_dom',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+  self.assertNotIn('setTimeout',m.merchant_script('123','问库存','商品店'))

@@ -72,6 +72,7 @@ class FakeBridge:
         self.text = "京东首页 你好 我的京东"
         self.result = []
         self.login_overlay = False
+        self.visible = True
         self.find_response = None
 
     async def command(self, action, args=None):
@@ -88,6 +89,9 @@ class FakeBridge:
             if self.find_response is not None:
                 return self.find_response
             return {"success": True, "tabId": 123, "url": args["url"], "borrowed": False}
+        if action == "cdp":
+            self.visible = True
+            return {"success": True}
         if action == "snapshot":
             return {"url": self.url, "title": "京东", "text": self.text}
         if action == "evaluate":
@@ -95,7 +99,7 @@ class FakeBridge:
                 return {"type": "string", "value": json.dumps({"ready": True})}
             if "JD_META" in args["code"]:
                 risk = any(marker in self.text for marker in ("访问频繁", "系统繁忙", "安全验证"))
-                return {"type": "string", "value": json.dumps({"url": self.url, "title": "京东", "risk_control": risk,
+                return {"type": "string", "value": json.dumps({"url": self.url, "title": "京东", "risk_control": risk, "page_visible": self.visible,
                     "requires_user_login": "passport.jd.com" in self.url or self.login_overlay, "likely_logged_in": "我的京东" in self.text})}
             return {"type": "string", "value": json.dumps(self.result)}
         if action == "close_session":

@@ -1,40 +1,69 @@
 """Personal notification outbox and opt-in low-frequency watchlist refresh.
 
-Uses the existing macOS notification channel, or an owner-configured command.
+Uses only the owner-configured mail MCP; no desktop notification fallback.
 Command acceptance is distinct from proof the owner saw a notification.
 """
 import asyncio
 import hashlib
 import json
 import os
-import platform
 import sqlite3
-import subprocess
 import time
+from pathlib import Path
+from urllib.parse import urlsplit
+import httpx
 from contextlib import contextmanager
 
 
-async def send_native(title, body):
-    def send():
-        configured = os.environ.get('MCP_NOTIFY_COMMAND_JSON', '')
-        if configured:
-            command = json.loads(configured)
-            if not isinstance(command, list) or not command or not all(isinstance(x, str) and x for x in command):
-                raise ValueError('invalid owner notification command configuration')
-            # Only trusted process configuration defines the executable; MCP input never does.
-            completed = subprocess.run(command, input=json.dumps({'title': title, 'body': body}), text=True, capture_output=True, timeout=15)
-        elif platform.system() == 'Darwin':
-            script = 'on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run'
-            completed = subprocess.run(['/usr/bin/osascript', '-e', script, title, body], capture_output=True, text=True, timeout=15)
-        else:
-            return {'status': 'failed', 'receipt': 'owner_notification_channel_not_configured'}
-        return {'status': 'accepted' if completed.returncode == 0 else 'failed', 'receipt': 'receiver_accepted_display_unverified' if completed.returncode == 0 else 'receiver_rejected'}
-    return await asyncio.to_thread(send)
+async def send_mail(title, body, *, config_path=None, configuration=None, transport=None):
+    """Submit exactly once through an owner-configured mail MCP; never fall back to UI alerts."""
+    try:
+        if configuration is None:
+            configured = os.environ.get('MCP_MAIL_CONFIG')
+            path = Path(configured) if configured else Path(config_path) if config_path else None
+            configuration = json.loads(path.read_text()) if path and path.exists() else {}
+        cfg = configuration
+        if not isinstance(cfg, dict) or not all(isinstance(cfg.get(k), str) and cfg[k] for k in ('url', 'sender', 'recipient')):
+            return {'status': 'failed', 'receipt': 'mail_channel_not_configured'}
+        parsed = urlsplit(cfg['url'])
+        if parsed.scheme not in {'http','https'} or not parsed.hostname or parsed.username or parsed.password:
+            return {'status': 'failed', 'receipt': 'invalid_owner_mail_configuration'}
+        if any(c in cfg[k] for k in ('sender','recipient') for c in ('\r','\n',',')):
+            return {'status': 'failed', 'receipt': 'invalid_owner_mail_configuration'}
+        reference = 'commerce-' + hashlib.sha256((title+'|'+body).encode()).hexdigest()[:12]
+        arguments = {'from':cfg['sender'], 'to':cfg['recipient'], 'subject':title+' ['+reference+']', 'body':body, 'isHtml':False, 'skipReview':True}
+        async with httpx.AsyncClient(timeout=45, trust_env=False, follow_redirects=False, transport=transport) as client:
+            response = await client.post(cfg['url'], headers={'Accept':'application/json, text/event-stream', **cfg.get('headers', {})}, json={'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'sendMail','arguments':arguments}})
+        if response.status_code in (400,401,403,404):
+            return {'status':'failed','receipt':'mail_endpoint_rejected'}
+        if response.status_code != 200 or len(response.content) > 262144:
+            return {'status':'unknown','receipt':'mail_submission_outcome_unknown_no_retry'}
+        raw = response.text
+        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith('data: ')]
+        envelope = next((event for event in reversed(events) if event.get('id') == 1), None) if events else json.loads(raw)
+        if not isinstance(envelope, dict) or envelope.get('error'):
+            return {'status':'failed','receipt':'mail_rpc_rejected'}
+        result = envelope.get('result', {})
+        if result.get('isError'):
+            return {'status':'failed','receipt':'mail_tool_rejected'}
+        message = json.loads(next(block['text'] for block in result.get('content', []) if block.get('type') == 'text'))
+        if message.get('success') is True and message.get('message') == 'Message sent':
+            return {'status':'accepted','receipt':'mail_reported_sent_delivery_unverified:'+reference}
+        if message.get('message') == 'Compose window opened' or 'skipReview' in str(message.get('error','')):
+            return {'status':'failed','receipt':'mail_review_required_not_sent'}
+        return {'status':'unknown','receipt':'mail_submission_outcome_unknown_no_retry'}
+    except httpx.ConnectError:
+        return {'status':'failed','receipt':'mail_endpoint_unreachable'}
+    except (httpx.TimeoutException, httpx.HTTPError):
+        return {'status':'unknown','receipt':'mail_submission_outcome_unknown_no_retry'}
+    except (OSError, ValueError, TypeError, KeyError, StopIteration):
+        return {'status':'failed','receipt':'mail_configuration_or_response_invalid'}
 
 
 class Notifications:
-    def __init__(self, watchlist, refresh, *, sender=send_native, clock=time.time):
-        self.store, self.refresh, self.sender, self.clock = watchlist, refresh, sender, clock
+    def __init__(self, watchlist, refresh, *, sender=None, clock=time.time):
+        self.store, self.refresh, self.clock = watchlist, refresh, clock
+        self.sender = sender or (lambda title, body: send_mail(title, body, config_path=self.store.path.parent / "notification-mail.json"))
         self.task = None
         self.wake = asyncio.Event()
 
@@ -65,7 +94,7 @@ class Notifications:
         with self.db() as db:
             settings = db.execute('SELECT * FROM notify_settings').fetchone()
             events = [dict(r) for r in db.execute('SELECT id,url,delivery_status,receipt,created_at FROM notify_events ORDER BY created_at DESC LIMIT 30')]
-        return self.result({'enabled': bool(settings['enabled']), 'interval_minutes': settings['minutes'], 'paused_reason': settings['paused'], 'events': events, 'worker_running': bool(self.task and not self.task.done()), 'display_verified': False})
+        return self.result({'enabled': bool(settings['enabled']), 'interval_minutes': settings['minutes'], 'paused_reason': settings['paused'], 'events': events, 'worker_running': bool(self.task and not self.task.done()), 'display_verified': False, 'channel': 'email'})
 
     def enqueue(self, key, url, title, body):
         event_id = hashlib.sha256((self.store.platform+'|'+key).encode()).hexdigest()
@@ -73,7 +102,7 @@ class Notifications:
             db.execute('INSERT OR IGNORE INTO notify_events VALUES(?,?,?,?,?,?,?,?)', (event_id, url, title, body, 'pending', '', self.clock(), 0))
             state = db.execute('SELECT delivery_status FROM notify_events WHERE id=?', (event_id,)).fetchone()[0]
         self.wake.set()
-        return self.result({'event_id': event_id, 'delivery_status': state, 'display_verified': False})
+        return self.result({'event_id': event_id, 'delivery_status': state, 'display_verified': False, 'channel': 'email'})
 
     def notify_owner(self, url, summary, evidence):
         url = self.store.validate_url(url)
@@ -129,7 +158,7 @@ class Notifications:
             with self.db() as db:
                 db.execute("UPDATE notify_events SET delivery_status='unknown',receipt='worker_cancelled_no_automatic_resend' WHERE id=?", (event['id'],))
             raise
-        except (TimeoutError, subprocess.TimeoutExpired):
+        except TimeoutError:
             state, detail = 'unknown', 'delivery_interrupted_or_timed_out_no_automatic_resend'
         except Exception:
             state, detail = 'failed', 'notification_channel_failed'
@@ -180,7 +209,7 @@ def register_notifications(mcp, notifications):
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
     async def notify_owner(url: str, summary: str, evidence: str) -> dict:
-        """智能体判断交易条件达成后通知本人；须明确本平台商品URL、条件摘要和依据；本人下单支付。同内容去重。"""
+        """智能体判断交易条件达成后邮件通知本人；须明确本平台商品URL、条件摘要和依据；本人下单支付。同内容去重。"""
         try:
             result = notifications.notify_owner(url, summary, evidence)
             notifications.start()

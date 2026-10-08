@@ -57,11 +57,19 @@ const authControls=[...document.querySelectorAll('input[type="password"],input[a
  const s=getComputedStyle(el); return s.display!=='none' && s.visibility!=='hidden' && s.visibility!=='collapse' && s.opacity!=='0'
  && [...el.getClientRects()].some(r=>r.width>0&&r.height>0);
 });
+const riskUrl=u.hostname==='cfe.m.jd.com' && /^\/privatedomain\/risk_handler(?:\/|$)/.test(u.pathname);
+if(riskUrl)u.pathname='/privatedomain/risk_handler/';
 const loginRequired=authControls||u.hostname==='passport.jd.com'||u.hostname.startsWith('plogin.')||u.pathname.toLowerCase().includes('/login');
+const riskControl=riskUrl || /访问频繁|访问过于频繁|频繁.{0,12}(访问|搜索|操作)|系统繁忙|操作频繁|请求频繁|安全验证|滑块|人机验证|captcha|异常访问|无法搜索|验证失败/i.test(t);
+const modernLoggedIn=[...document.querySelectorAll('div.dt.cw-icon > a.nickname[href*="home.jd.com"]')].some(el=>{
+ const s=getComputedStyle(el);if(s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse'||s.opacity==='0'||![...el.getClientRects()].some(r=>r.width>0&&r.height>0)||!String(el.textContent||'').trim())return false;
+ try{return new URL(el.getAttribute('href'),location.href).hostname==='home.jd.com';}catch{return false;}
+});
 return JSON.stringify({url:u.href,title:document.title.slice(0,300),
-risk_control:/访问频繁|访问过于频繁|频繁.{0,12}(访问|搜索|操作)|系统繁忙|操作频繁|请求频繁|安全验证|滑块|人机验证|captcha|异常访问|无法搜索|验证失败/i.test(t),
+page_visible:document.visibilityState==='visible',
+risk_control:riskControl,
 requires_user_login:loginRequired,
-likely_logged_in:!loginRequired && !t.includes('请登录') && (/退出(?:登录)?/.test(t) || [...document.querySelectorAll('#ttbar-login .nickname,a[href*="logout"]')].some(el=>el.getClientRects().length))}); })()"""
+likely_logged_in:!riskControl && !loginRequired && !t.includes('请登录') && (modernLoggedIn || /退出(?:登录)?/.test(t) || [...document.querySelectorAll('#ttbar-login .nickname,a[href*="logout"]')].some(el=>el.getClientRects().length))}); })()"""
 RISK_RE = re.compile(r"访问频繁|访问过于频繁|频繁.{0,12}(?:访问|搜索|操作)|系统繁忙|操作频繁|请求频繁|安全验证|滑块|人机验证|captcha|异常访问|无法搜索|验证失败", re.I)
 
 
@@ -106,6 +114,8 @@ def public_url(url: str) -> str:
         if parsed.scheme not in {"http", "https"} and not url.startswith("//"):
             return url
         query = ""
+        if risk_url(url):
+            return urlunparse((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], "/privatedomain/risk_handler/", "", "", ""))
         if parsed.hostname in {"search.jd.com", "search.360buy.com"} and parsed.path.lower() == "/search":
             query = urlencode([(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
                                if key in {"keyword", "q"}])
@@ -127,6 +137,11 @@ def public_result(value: Any) -> Any:
     return value
 
 
+def risk_url(url):
+    parsed=urlparse(url)
+    return parsed.hostname=='cfe.m.jd.com' and bool(re.match(r'/privatedomain/risk_handler(?:/|$)',parsed.path))
+
+
 class BridgeError(RuntimeError):
     """Intentionally exclude upstream message/URL/token from exception text."""
 
@@ -140,7 +155,10 @@ class WebBridgeClient:
         self.http = httpx.AsyncClient(timeout=30, trust_env=False, follow_redirects=False, transport=transport)
 
     async def command(self, action: str, args: dict[str, Any] | None = None) -> Any:
-        if action not in {"list_tabs", "find_tab", "navigate", "snapshot", "evaluate", "close_session"}:
+        if action == 'cdp':
+            if not isinstance(args, dict) or set(args) != {'method','params'} or args['method'] != 'Page.bringToFront' or args['params'] != {}:
+                raise BridgeError('Only fixed owned-page fronting is allowed')
+        elif action not in {"list_tabs", "find_tab", "navigate", "snapshot", "evaluate", "close_session"}:
             raise BridgeError("Unsupported bridge action")
         response = await self.http.post(BRIDGE_ENDPOINT, json={"action": action, "args": args or {}, "session": BRIDGE_SESSION})
         response.raise_for_status()
@@ -271,7 +289,7 @@ class JDBridgeAdapter(JDCommerce):
         if not isinstance(meta, dict) or not isinstance(meta.get("url"), str):
             raise BridgeError("Invalid page metadata")
         ensure_jd_url(meta["url"])
-        risk = bool(meta.get("risk_control"))
+        risk = bool(meta.get("risk_control")) or risk_url(meta["url"])
         login = bool(meta.get("requires_user_login"))
         # Never snapshot a login/verification page while the user may be typing
         # OTP/password. Semantic snapshots are only for ordinary business pages.
@@ -282,7 +300,7 @@ class JDBridgeAdapter(JDCommerce):
         result = {"current_url": meta["url"], "title": compact_text(meta.get("title"), 300),
                   "requires_user_verification": risk, "risk_control": risk,
                   "requires_user_login": login, "likely_logged_in": bool(meta.get("likely_logged_in")) and not login,
-                  "browser_running": True}
+                  "browser_running": True, "page_visible": bool(meta.get("page_visible"))}
         if risk:
             self._risk = result
         return result
@@ -587,7 +605,7 @@ def build_mcp(adapter: JDBridgeAdapter) -> FastMCP:
 
     @server.tool(annotations=write)
     async def add_to_cart(url: str, sku_text: str | None = None, qty: int = 1, operation_id: str | None = None) -> dict[str, Any]:
-        """精确商品与已选规格新增1至3件；operation_id持久去重，省略时同参数沿用默认ID，未知结果禁止重试。"""
+        """精确商品与已选规格新增1至3件；operation_id持久去重，未知时同ID仅只读核对，不再次点击；省略时同参数沿用默认ID。"""
         return await public_tool_call(adapter.add_to_cart(url, sku_text, qty, operation_id))
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True))

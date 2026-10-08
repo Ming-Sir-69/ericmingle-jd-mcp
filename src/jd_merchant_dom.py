@@ -29,11 +29,8 @@ stop=guard();if(stop)return stop;
 const current=object();if(!current||current.recipient!==target.recipient||normalize(editors[0].textContent)!==normalize(cfg.body))return fail('merchant_identity_unverified');
 const audit={changed:false,verified:false,product_id:cfg.id,recipient:target.recipient};
 send[0].click();audit.changed=true;
-for(let i=0;i<10;i++){
- stop=guard();if(stop)return JSON.stringify({...JSON.parse(stop),audit});
- const now=object();if(!now||now.recipient!==target.recipient)return JSON.stringify({success:false,error:'merchant_identity_unverified',audit});
- if(messages().filter(x=>x.text===normalize(cfg.body)).length>before)return JSON.stringify({success:true,object:target,audit:{...audit,verified:true},receipt:'message_visible_in_conversation'});
- await new Promise(resolve=>setTimeout(resolve,150));
-}
+stop=guard();if(stop)return JSON.stringify({...JSON.parse(stop),audit});
+const now=object();if(!now||now.recipient!==target.recipient)return JSON.stringify({success:false,error:'merchant_identity_unverified',audit});
+if(messages().filter(x=>x.text===normalize(cfg.body)).length>before)return JSON.stringify({success:true,object:target,audit:{...audit,verified:true},receipt:'message_visible_in_conversation'});
 return JSON.stringify({success:false,error:'unverified',audit,message:'已单次发送，未取得会话读回；禁止自动重试。'});
 '''
